@@ -2,12 +2,16 @@ import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
 import connectDB from "./config/db.js";
+import userRoutes from "./modules/users/user.routes.js";
+import authMiddleware from "../src/middlewares/auth.middleware.js";
 
 dotenv.config();
 const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+app.use("/auth", userRoutes);
 
 // health check endpoint
 app.get("/health", (req, res) => {

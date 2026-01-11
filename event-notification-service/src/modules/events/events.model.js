@@ -22,7 +22,7 @@ const eventSchema = new mongoose.Schema(
       unique: true,
       sparse: true,
     },
-    statue: {
+    status: {
       type: String,
       enum: ["PENDING", "PROCESSED", "FAILED"],
       default: "PENDING",

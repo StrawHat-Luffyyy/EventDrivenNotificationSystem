@@ -20,7 +20,7 @@ const notificationSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
-    channel: {
+    channels: {
       type: String,
       enum: ["IN_APP", "EMAIL", "PUSH"],
       default: "IN_APP",

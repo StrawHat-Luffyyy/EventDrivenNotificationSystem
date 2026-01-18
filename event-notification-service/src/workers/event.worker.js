@@ -13,6 +13,7 @@ await connectDB();
 const eventWorker = new Worker(
   "eventQueue",
   async (job) => {
+    if (job.name !== "processEvent") return;
     const { eventId } = job.data;
     const event = await Event.findById(eventId);
     if (!event) {
@@ -38,21 +39,37 @@ const eventWorker = new Worker(
     if (preferences.channels.inApp) channels.push("IN_APP");
     if (preferences.channels.email) channels.push("EMAIL");
     if (preferences.channels.push) channels.push("PUSH");
+
+    let successfulChannels = 0;
     // create notifications + logs
     for (const channel of channels) {
-      const notification = await Notification.create({
-        userId,
-        eventId,
-        title,
-        message,
-        channel,
-      });
-      await DeliveryLog.create({
-        notificationId: notification._id,
-        channel,
-        status: "SUCCESS",
-        attemptCount: 1,
-      });
+      try {
+        const notification = await Notification.create({
+          userId,
+          eventId,
+          title,
+          message,
+          channel,
+        });
+        await DeliveryLog.create({
+          notificationId: notification._id,
+          channel,
+          status: "SUCCESS",
+          attemptCount: 1,
+        });
+      } catch (error) {
+        await DeliveryLog.create({
+          eventId,
+          channel,
+          status: "FAILED",
+          attemptCount: job.attemptsMade + 1,
+          error: error.message,
+        });
+      }
+    }
+    //  If ALL channels failed → retry job
+    if (successfulChannels === 0) {
+      throw new Error("All notification channels failed");
     }
     //Marked as processed
     event.status = "PROCESSED";

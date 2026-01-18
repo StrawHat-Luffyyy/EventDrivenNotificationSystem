@@ -4,6 +4,7 @@ import cors from "cors";
 import connectDB from "./config/db.js";
 import userRoutes from "./modules/users/user.routes.js";
 import eventRoutes from "./modules/events/event.routes.js";
+import notificationRoutes from "./modules/notifications/notification.routes.js";
 
 dotenv.config();
 const app = express();
@@ -13,6 +14,7 @@ app.use(express.json());
 
 app.use("/auth", userRoutes);
 app.use("/events", eventRoutes);
+app.use("/notifications", notificationRoutes);
 
 // health check endpoint
 app.get("/health", (req, res) => {

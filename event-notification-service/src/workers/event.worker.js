@@ -1,47 +1,46 @@
 import { Worker } from "bullmq";
 import redis from "../config/redis.js";
-import Event from "../modules/events/events.model.js";
+import dotenv from "dotenv";
 import connectDB from "../config/db.js";
-import { getNotificationContent } from "../utils/notificationTemplates.js";
+import Event from "../modules/events/events.model.js";
+import Notification from "../modules/notifications/notification.model.js";
 import UserPreferences from "../modules/userPreferences/userPreferences.model.js";
 import DeliveryLog from "../modules/deliveryLogs/deliveryLog.model.js";
-import dotenv from "dotenv";
+import { getNotificationContent } from "../utils/notificationTemplates.js";
 
 dotenv.config();
-
 await connectDB();
+
 const eventWorker = new Worker(
   "eventQueue",
   async (job) => {
-    if (job.name !== "processEvent") return;
+    if (job.name !== "processEvent") return; // Ignore unknown jobs
     const { eventId } = job.data;
     const event = await Event.findById(eventId);
-    if (!event) {
-      throw new Error(`Event with ID ${eventId} not found`);
-    }
+    if (!event) throw new Error(`Event ${eventId} not found`);
     const { eventType, payload, userId } = event;
-    // fetch preferences
+    // 1️ Fetch preferences
     const preferences =
       (await UserPreferences.findOne({ userId })) ||
       (await UserPreferences.create({ userId }));
-    //check is event type is enabled
-    const isEventEnabled = preferences.eventTypes.get(eventType) ?? true;
-    if (!isEventEnabled) {
-      console.log(`Event ${eventType} is disabled for user ${userId}.`);
+    // 2️ Event type enabled?
+    const isEventEnabled = preferences.eventTypes.get(eventType) ?? true; // Default to true
+    if (!isEventEnabled) // Skip processing
+    {
       event.status = "PROCESSED";
       await event.save();
       return;
     }
-    // Notification content
+    // 3️ Notification content
     const { title, message } = getNotificationContent(eventType, payload);
-    //channels to send
+    // 4️ Channels
     const channels = [];
     if (preferences.channels.inApp) channels.push("IN_APP");
     if (preferences.channels.email) channels.push("EMAIL");
     if (preferences.channels.push) channels.push("PUSH");
 
     let successfulChannels = 0;
-    // create notifications + logs
+    // 5️ Create notifications + delivery logs
     for (const channel of channels) {
       try {
         const notification = await Notification.create({
@@ -55,43 +54,50 @@ const eventWorker = new Worker(
           notificationId: notification._id,
           channel,
           status: "SUCCESS",
-          attemptCount: 1,
+          attemptCount: job.attemptsMade + 1, // BullMQ attempts start from 0
         });
+        successfulChannels++; // Count successful channels
       } catch (error) {
         await DeliveryLog.create({
-          eventId,
+          notificationId: null, // Notification creation failed
           channel,
           status: "FAILED",
           attemptCount: job.attemptsMade + 1,
-          error: error.message,
+          errorMessage: error.message,
         });
       }
     }
-    //  If ALL channels failed → retry job
+    // 6️ Retry if ALL channels failed
     if (successfulChannels === 0) {
       throw new Error("All notification channels failed");
     }
-    //Marked as processed
+    // 7️ Mark event processed
     event.status = "PROCESSED";
     await event.save();
   },
-  // Worker options
   {
     connection: redis,
-    attempts: 3, // Retry up to 3 times on failure
+    attempts: 3,
     backoff: {
       type: "exponential",
-      delay: 2000, // Initial delay of 2 seconds
+      delay: 2000,
     },
   },
 );
 
 eventWorker.on("completed", (job) => {
-  console.log(`Job with ID ${job.id} has been completed`);
+  console.log(`Job ${job.id} completed`);
 });
 
-eventWorker.on("failed", (job, err) => {
-  console.error(`Job with ID ${job.id} has failed with error: ${err.message}`);
+eventWorker.on("failed", async (job, err) => {
+  console.error(`Job ${job.id} failed: ${err.message}`);
+  if (job.attemptsMade >= job.opts.attempts) {
+    const event = await Event.findById(job.data.eventId);
+    if (event) {
+      event.status = "FAILED";
+      await event.save();
+    }
+  }
 });
 
 export default eventWorker;

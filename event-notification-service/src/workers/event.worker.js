@@ -15,35 +15,64 @@ await connectDB();
 const eventWorker = new Worker(
   "eventQueue",
   async (job) => {
-    if (job.name !== "processEvent") return; // Ignore unknown jobs
+    if (job.name !== "processEvent") return;
+
     const { eventId } = job.data;
+
+    // Validate eventId
+    if (!eventId) {
+      throw new Error("eventId is required in job data");
+    }
+
     const event = await Event.findById(eventId);
-    if (!event) throw new Error(`Event ${eventId} not found`);
+    if (!event) {
+      throw new Error(`Event ${eventId} not found`);
+    }
+
     const { eventType, payload, userId } = event;
-    // 1️ Fetch preferences
+
+    // Fetch preferences
     const preferences =
       (await UserPreferences.findOne({ userId })) ||
       (await UserPreferences.create({ userId }));
-    // 2️ Event type enabled?
-    const isEventEnabled = preferences.eventTypes.get(eventType) ?? true; // Default to true
-    if (!isEventEnabled) // Skip processing
-    {
+
+    // Event type enabled?
+    const isEventEnabled = preferences.eventTypes.get(eventType) ?? true;
+    if (!isEventEnabled) {
       event.status = "PROCESSED";
       await event.save();
+      console.log(
+        `Event ${eventId} skipped - event type ${eventType} disabled for user ${userId}`,
+      );
       return;
     }
-    // 3️ Notification content
+
+    // Notification content
     const { title, message } = getNotificationContent(eventType, payload);
-    // 4️ Channels
+
+    // Channels
     const channels = [];
     if (preferences.channels.inApp) channels.push("IN_APP");
     if (preferences.channels.email) channels.push("EMAIL");
     if (preferences.channels.push) channels.push("PUSH");
 
+    // Check if any channels are enabled
+    if (channels.length === 0) {
+      event.status = "PROCESSED";
+      await event.save();
+      console.log(
+        `Event ${eventId} skipped - no channels enabled for user ${userId}`,
+      );
+      return;
+    }
+
     let successfulChannels = 0;
-    // 5️ Create notifications + delivery logs
+    const errors = []; // Collect errors for logging
+
+    // Create notifications + delivery logs
     for (const channel of channels) {
       try {
+        // Create notification first
         const notification = await Notification.create({
           userId,
           eventId,
@@ -51,97 +80,140 @@ const eventWorker = new Worker(
           message,
           channel,
         });
+
+        // Then create delivery log
         await DeliveryLog.create({
           notificationId: notification._id,
           channel,
           status: "SUCCESS",
-          attemptCount: job.attemptsMade + 1, // BullMQ attempts start from 0
+          attemptCount: job.attemptsMade + 1,
         });
-        successfulChannels++; // Count successful channels
-        // Real-time notification for In-App channel
+
+        successfulChannels++;
+
+        // Real-time notification only for In-App channel
         if (channel === "IN_APP") {
-          const io = getIO();
-          if (io) {
-            io.to(userId.toString()).emit("new_notification", {
-              notificationId: notification._id,
-              title,
-              message,
-              channel,
-              createdAt: notification.createdAt,
-            });
+          try {
+            const io = getIO();
+            if (io) {
+              io.to(userId.toString()).emit("new_notification", {
+                notificationId: notification._id,
+                title,
+                message,
+                channel,
+                createdAt: notification.createdAt,
+              });
+              console.log(`Socket notification sent to user ${userId}`);
+            }
+          } catch (socketError) {
+            console.error(
+              `Socket emit error for user ${userId}:`,
+              socketError.message,
+            );
+            // Don't fail the job if socket emission fails
           }
         }
+
+        // TODO: Add actual email/push notification sending here
+        // if (channel === "EMAIL") {
+        //   await sendEmail(userId, title, message);
+        // }
+        // if (channel === "PUSH") {
+        //   await sendPushNotification(userId, title, message);
+        // }
       } catch (error) {
-        await DeliveryLog.create({
-          notificationId: null, // Notification creation failed
-          channel,
-          status: "FAILED",
-          attemptCount: job.attemptsMade + 1,
-          errorMessage: error.message,
-        });
+        console.error(
+          `Failed to create notification for channel ${channel}:`,
+          error,
+        );
+        errors.push({ channel, error: error.message });
+
+        // Create failed delivery log (no notificationId since creation failed)
+        try {
+          await DeliveryLog.create({
+            notificationId: null,
+            channel,
+            status: "FAILED",
+            attemptCount: job.attemptsMade + 1,
+            errorMessage: error.message,
+          });
+        } catch (logError) {
+          console.error(`Failed to create delivery log:`, logError);
+        }
       }
     }
-    // 6️ Retry if ALL channels failed
+
+    // Retry if ALL channels failed
     if (successfulChannels === 0) {
-      throw new Error("All notification channels failed");
+      const errorMsg = `All notification channels failed: ${JSON.stringify(errors)}`;
+      console.error(errorMsg);
+      throw new Error(errorMsg);
     }
-    // 7️ Mark event processed
+
+    // Log partial success
+    if (successfulChannels < channels.length) {
+      console.warn(
+        `Event ${eventId}: ${successfulChannels}/${channels.length} channels succeeded. Errors:`,
+        errors,
+      );
+    }
+
+    // Mark event processed
     event.status = "PROCESSED";
     await event.save();
+    console.log(
+      `Event ${eventId} processed successfully (${successfulChannels}/${channels.length} channels)`,
+    );
   },
-  // Worker options
   {
     connection: redis,
-    attempts: 10,
-    backoff: {
-      type: "exponential",
-      delay: 2000,
+    concurrency: 10, // Process up to 10 jobs concurrently
+    limiter: {
+      max: 100, // Max 100 jobs
+      duration: 60000, // Per minute
     },
   },
 );
 
 eventWorker.on("completed", (job) => {
-  console.log(`Job ${job.id} completed`);
+  console.log(`Job ${job.id} completed successfully`);
 });
 
 eventWorker.on("failed", async (job, err) => {
   console.error(`Job ${job.id} failed: ${err.message}`);
-  if (job.attemptsMade >= job.opts.attempts) {
-    const event = await Event.findById(job.data.eventId);
-    if (event) {
-      event.status = "FAILED";
-      await event.save();
+
+  // Mark event as failed only after all retries exhausted
+  if (job.attemptsMade >= 10) {
+    // Match the attempts in queue options
+    try {
+      const event = await Event.findById(job.data.eventId);
+      if (event) {
+        event.status = "FAILED";
+        await event.save();
+        console.error(
+          `Event ${job.data.eventId} marked as FAILED after ${job.attemptsMade} attempts`,
+        );
+      }
+    } catch (dbError) {
+      console.error(`Failed to mark event as FAILED:`, dbError);
     }
+  } else {
+    console.log(
+      `Job ${job.id} will retry (attempt ${job.attemptsMade + 1}/10)`,
+    );
   }
 });
 
-export default eventWorker;
+// Handle worker errors
+eventWorker.on("error", (error) => {
+  console.error("Worker error:", error);
+});
 
-/*
-Flow Explanation:
-We are importing Worker from bullmq and other necessary modules like mongoose models and config files.
-We are configuring dotenv and connecting to the database.
-Now we are creating a new Worker named eventWorker which listens to the eventQueue
-first check if that eventtype is processEvent then we will proceed further or we'll return
-then take eventId from job.data
-check if eventID is present or not if not we'll throw an error
-Now we'll check if userPref is there or not from eventId if not  we'll create a new pref
-So now if preference is there so that we'll check that if that event is Enabled or not 
-if not then we'll save that event as processes and we'll save it and return 
-so now if the event is enabled we'll send a notification
-so we'll destructure title and message from getNotificationtemplate(eventType , payload)
-we'll create a empty array of channels
-Now we'll check if (preference.channels.InApp) channels.push("IN_APP") similarly for the other channels too.
-Now we'll create a for loop[const channel from channels] in which we'll create Notifications and DeliveryLogs
-we'll start inside the loop with a variable named successfulChannels which is initialzed from 0 to keep the count of how many channels are successfully executed and this is outside the trycatch block.
-Now we'll wrap it with trycatch because of the db operation
-first we'll create Notification followed by DeliveryLogs in the try block and after the creation of the deliveylog we'll increase the value of the successfulChannels++
-and in the catch block we'll do DeliveryLog with a status FAILED
-and now we are out of the trycatch and loop and we'll check if successfulChannels === 0 then we'll return a Error mesaage saying all the channels failed to create the notification
-Now we'll marked the event as PROCESSED and save it in and return
-Now we'll configure worker options like connection , attempts and backoff{ type-exponential and delay }
-Now we are out of the eventWorker and we'll handle what to do when the job succeeds or fails 
-if it succeeds we'll do a console log job completed with job id
-if it fails we'll do console.log Job failed 
-and If it fails too many times → mark the related event as FAILED in the database  
-*/
+// Graceful shutdown
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received, closing worker...");
+  await eventWorker.close();
+  process.exit(0);
+});
+
+export default eventWorker;

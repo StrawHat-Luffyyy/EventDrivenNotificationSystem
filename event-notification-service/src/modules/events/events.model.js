@@ -28,7 +28,17 @@ const eventSchema = new mongoose.Schema(
       default: "PENDING",
     },
   },
-  { timestamps: true }
+  { timestamps: true },
+);
+// Compound index to optimize queries by userId and eventType
+eventSchema.index({ userId: 1, eventType: 1, createdAt: -1 });
+// TTL index to auto-delete old processed events after 30 days
+eventSchema.index(
+  { createdAt: 1 },
+  {
+    expireAfterSeconds: 2592000, // 30 days
+    partialFilterExpression: { status: "PROCESSED" },
+  },
 );
 
 export default mongoose.model("Event", eventSchema);

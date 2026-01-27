@@ -7,6 +7,7 @@ const preferenceSchema = new mongoose.Schema(
       ref: "User",
       unique: true,
       required: true,
+      index: true,
     },
     channels: {
       email: { type: Boolean, default: true },
@@ -15,11 +16,20 @@ const preferenceSchema = new mongoose.Schema(
     },
     eventTypes: {
       type: Map,
-      of: boolean,
+      of: Boolean,
       default: {},
     },
+    quietHours: {
+      enabled: { type: Boolean, default: false },
+      startTime: { type: String, default: "22:00" }, // Format: "HH:mm"
+      endTime: { type: String, default: "08:00" },
+    },
+    frequency: {
+      maxPerHour: { type: Number, default: 10 },
+      maxPerDay: { type: Number, default: 100 },
+    },
   },
-  { timestamps: true }
+  { timestamps: true },
 );
 
 export default mongoose.model("UserPreference", preferenceSchema);

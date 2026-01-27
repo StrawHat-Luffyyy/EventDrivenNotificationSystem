@@ -56,5 +56,8 @@ export const createEvent = async (req, res) => {
       message: "Event accepted for processing.",
       eventId: event._id,
     });
-  } catch (error) {}
+  } catch (error) {
+    console.error("Error creating event:", error);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
 };

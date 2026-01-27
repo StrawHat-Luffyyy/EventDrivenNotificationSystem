@@ -7,6 +7,7 @@ import Notification from "../modules/notifications/notification.model.js";
 import UserPreferences from "../modules/preferences/preference.model.js";
 import DeliveryLog from "../modules/deliveryLogs/deliveryLog.model.js";
 import { getNotificationContent } from "../utils/notificationTemplates.js";
+import { getIO } from "../socket.js";
 
 dotenv.config();
 await connectDB();
@@ -57,6 +58,19 @@ const eventWorker = new Worker(
           attemptCount: job.attemptsMade + 1, // BullMQ attempts start from 0
         });
         successfulChannels++; // Count successful channels
+        // Real-time notification for In-App channel
+        if (channel === "IN_APP") {
+          const io = getIO();
+          if (io) {
+            io.to(userId.toString()).emit("new_notification", {
+              notificationId: notification._id,
+              title,
+              message,
+              channel,
+              createdAt: notification.createdAt,
+            });
+          }
+        }
       } catch (error) {
         await DeliveryLog.create({
           notificationId: null, // Notification creation failed
@@ -102,7 +116,6 @@ eventWorker.on("failed", async (job, err) => {
 });
 
 export default eventWorker;
-
 
 /*
 Flow Explanation:
